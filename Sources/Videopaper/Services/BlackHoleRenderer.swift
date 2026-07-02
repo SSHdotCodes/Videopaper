@@ -364,6 +364,20 @@ final class BlackHoleRenderer {
     }
 
     // ------------------------------------------------------------ disk -----
+    // One advected pattern shears without bound under differential rotation
+    // (Omega ~ r^-3/2): after minutes of wall-clock time it winds into
+    // near-perfect concentric rings, and a rotating axisymmetric pattern
+    // looks STATIC. Classic flow-map fix: two layers with shear bounded to
+    // +-FLOW_P/2, cross-faded so each layer resets while its weight is zero.
+    static float2 diskTex(float chi, float r, float Om, float tOff, float drift, float seed) {
+        float chiM = chi - Om * tOff * 8.0;
+        float tex  = fbm(float3(cos(chiM) * 0.9, sin(chiM) * 0.9, r * 1.65) * 2.2
+                         + float3(seed, seed * 1.7, seed * 0.6));
+        float tex2 = fbm(float3(cos(chiM) * 3.0, sin(chiM) * 3.0, r * 0.8)
+                         + float3(seed * 2.3, seed, drift));
+        return float2(tex, tex2);
+    }
+
     static float3 diskShade(float r, float chi, float Lz, float sqrtFcam,
                             float time, thread float &alpha) {
         float Om = pow(r, -1.5);                   // Keplerian angular velocity
@@ -374,10 +388,19 @@ final class BlackHoleRenderer {
         float xx = max(1.0 - sqrt(R_ISCO / r), 0.0);
         float Trel = pow(xx / (r * r * r), 0.25) * 7.857;
 
-        float chiM = chi - Om * time * 8.0;
-        float tex  = fbm(float3(cos(chiM) * 0.9, sin(chiM) * 0.9, r * 1.65) * 2.2);
-        float tex2 = fbm(float3(cos(chiM) * 3.0, sin(chiM) * 3.0, r * 0.8)
-                         + float3(0.0, 0.0, time * 0.05));
+        const float FLOW_P = 40.0;                 // seconds per shear cycle
+        float f0 = fract(time / FLOW_P);
+        float wA = 1.0 - abs(2.0 * f0 - 1.0);
+        float wB = 1.0 - wA;
+        float tA = (f0 - 0.5) * FLOW_P;
+        float tB = (fract(time / FLOW_P + 0.5) - 0.5) * FLOW_P;
+        float drift = time * 0.05;
+        float2 xA = diskTex(chi, r, Om, tA, drift, 0.0);
+        float2 xB = diskTex(chi, r, Om, tB, drift, 19.7);
+        // contrast-preserving blend of the two independent noise fields
+        float2 x = 0.5 + ((xA - 0.5) * wA + (xB - 0.5) * wB)
+                         * rsqrt(max(wA * wA + wB * wB, 0.5));
+        float tex = x.x, tex2 = x.y;
         float pattern = pow(0.35 + 1.30 * tex, 2.2) + 0.35 * tex2;
 
         float edgeIn  = smoothstep(R_ISCO, R_ISCO + 0.6, r);

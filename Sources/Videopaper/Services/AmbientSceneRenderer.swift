@@ -59,9 +59,9 @@ final class AmbientSceneRenderer {
 
         if style == .stars {
             startStarEvents(on: scene)
-        } else if style == .blackHole {
+        } else if style.usesMetal {
             let scale = hostLayer.contentsScale > 0 ? hostLayer.contentsScale : 2.0
-            if let renderer = BlackHoleRenderer() {
+            if let renderer = BlackHoleRenderer(scene: style) {
                 renderer.setPaused(isPaused)
                 renderer.attach(to: scene, bounds: bounds, scale: scale)
                 blackHole = renderer
@@ -146,7 +146,7 @@ private enum AmbientSceneFactory {
             addAnimatedGradient(to: root, palette: gradientPalette(for: .prism), bounds: bounds)
         case .ember:
             addAnimatedGradient(to: root, palette: gradientPalette(for: .ember), bounds: bounds)
-        case .blackHole:
+        case .blackHole, .pulsar, .quasar:
             break   // rendered live with Metal by AmbientSceneRenderer
         }
     }
@@ -984,7 +984,7 @@ private enum AmbientSceneFactory {
                     color(0.26, 0.13, 0.34).cgColor
                 ]
             )
-        case .stars, .sunrise, .daylight, .sunset, .moonlight, .blackHole:
+        case .stars, .sunrise, .daylight, .sunset, .moonlight, .blackHole, .pulsar, .quasar:
             GradientPalette(startColors: [], endColors: [])
         }
     }

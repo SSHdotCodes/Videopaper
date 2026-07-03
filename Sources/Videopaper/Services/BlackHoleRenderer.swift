@@ -23,6 +23,7 @@ import simd
 final class BlackHoleRenderer {
     let metalLayer = CAMetalLayer()
 
+    private let scene: AmbientStyle
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let scenePipeline: MTLRenderPipelineState
@@ -47,21 +48,24 @@ final class BlackHoleRenderer {
 
     private struct Uniforms { var res: SIMD2<Float>; var time: Float; var pad: Float }
     private struct PostUniforms { var size: SIMD2<Float>; var dir: SIMD2<Float> }
-    /// Cap render resolution: ~2560 px wide matches the quality the shader was
-    /// tuned at (measured ~4.4 ms/frame at 2560x1600 on an M4 Max) while
-    /// `resizeAspectFill` covers larger panels.
-    private let maxDrawableWidth: CGFloat = 2560
+    /// Cap render resolution: ~2560 px wide matches the quality the shaders
+    /// were tuned at while `resizeAspectFill` covers larger panels. The pulsar
+    /// (volumetric magnetosphere, ~15 ms at 2560x1440) gets a slightly lower
+    /// cap for beam-flash headroom at 60 fps.
+    private let maxDrawableWidth: CGFloat
     /// Render at 60 fps: full smoothness for the disk/lensing motion while
     /// halving GPU work on 120 Hz ProMotion panels (the display link fires at
     /// panel refresh; the limiter below drops every other callback there and
     /// passes every callback on 60 Hz displays).
     private let targetFrameInterval: CFTimeInterval = 1.0 / 60.0
 
-    init?() {
+    init?(scene: AmbientStyle = .blackHole) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
             return nil
         }
+        self.scene = scene
+        self.maxDrawableWidth = scene == .pulsar ? 2304 : 2560
         self.device = device
         self.queue = queue
 
@@ -78,7 +82,13 @@ final class BlackHoleRenderer {
                 desc.colorAttachments[0].pixelFormat = format
                 return try device.makeRenderPipelineState(descriptor: desc)
             }
-            scenePipeline = try pipeline("bh_scene", format: .rgba16Float)
+            let sceneFragment: String
+            switch scene {
+            case .pulsar: sceneFragment = "pulsar_scene"
+            case .quasar: sceneFragment = "quasar_scene"
+            default: sceneFragment = "bh_scene"
+            }
+            scenePipeline = try pipeline(sceneFragment, format: .rgba16Float)
             brightPipeline = try pipeline("bh_bright", format: .rgba16Float)
             blurPipeline = try pipeline("bh_blur", format: .rgba16Float)
             compositePipeline = try pipeline("bh_composite", format: .bgra8Unorm)
@@ -513,6 +523,389 @@ final class BlackHoleRenderer {
 
         if (escaped && trans > 0.02) {
             // asymptotic direction: dP/dphi ~ -w * rhat + u * that
+            float3 rhat = cos(phi) * er + sin(phi) * e2;
+            float3 that = -sin(phi) * er + cos(phi) * e2;
+            float3 escDir = normalize(-w * rhat + u * that);
+            col += trans * background(escDir);
+        }
+        return float4(col, 1.0);
+    }
+
+    // =========================================================== pulsar ====
+    // Oblique-rotator neutron star, R = 4.2M (2M/R = 0.48): exact Schwarzschild
+    // geodesics + a solid surface. Magnetic dipole tilted 35 deg corotates;
+    // hollow beam cones + dipole L-shell aurora accumulated volumetrically
+    // along the bent rays; magnetic-thermal surface map (hot caps, ember belt).
+    constant float PS_R_NS     = 4.2;
+    constant float PS_U_SURF   = 1.0 / 4.2;
+    constant float PS_U_ESC    = 1.0 / 70.0;
+    constant float PS_PHI_MAX  = 12.0;
+    constant int   PS_MAX_STEPS = 420;
+    constant float PS_OMEGA    = 2.0943951;          // spin 2*pi / 3 s
+    constant float3 PS_M0      = float3(0.573576, 0.0, 0.819152);  // 35 deg
+
+    static float fbm4(float3 p) {
+        float a = 0.5, s = 0.0;
+        for (int i = 0; i < 4; i++) {
+            s += a * vnoise(p);
+            p = p * 2.03 + float3(11.7, 5.3, 7.9);
+            a *= 0.55;
+        }
+        return s;
+    }
+    static float3 rotZ(float3 p, float a) {
+        float c = cos(a), s = sin(a);
+        return float3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
+    }
+
+    static float3 ps_volumeEmis(float3 P, float time) {
+        float r = length(P);
+        if (r < PS_R_NS || r > 60.0) return float3(0.0);
+        float3 pc = rotZ(P, -PS_OMEGA * time);
+        float3 pn = pc / r;
+        float ca = clamp(abs(dot(pn, PS_M0)), 0.0, 1.0);
+        float ang = acos(ca);
+
+        float3 e1m = normalize(cross(PS_M0, float3(0.0, 0.0, 1.0)));
+        float3 e2m = cross(PS_M0, e1m);
+        float pm = atan2(dot(pn, e2m), dot(pn, e1m));
+
+        float3 emis = float3(0.0);
+        float cone = exp(-pow((ang - 0.12) / 0.035, 2.0))
+                   + 0.55 * exp(-pow(ang / 0.05, 2.0));
+        if (cone > 1e-3) {
+            float rad = smoothstep(PS_R_NS, PS_R_NS + 2.2, r) * exp(-r / 18.0);
+            float fil = 0.55 + 0.75 * fbm4(float3(pm * 1.5, ang * 18.0, r * 0.45 - time * 3.0));
+            float3 beamCol = mix(float3(0.45, 0.60, 1.00), float3(0.85, 0.92, 1.00),
+                                 exp(-pow(ang / 0.06, 2.0)));
+            emis += beamCol * (cone * rad * fil * 0.55);
+        }
+        float s2 = max(1.0 - ca * ca, 1e-4);
+        float L = r / s2;
+        float shell = exp(-pow((L - 5.5) / 0.35, 2.0))
+                    + 0.60 * exp(-pow((L - 8.2) / 0.55, 2.0));
+        if (shell > 1e-3) {
+            shell *= exp(-(r - PS_R_NS) / 5.5) * smoothstep(PS_R_NS + 0.15, PS_R_NS + 1.1, r);
+            float wisp = fbm4(pn * 3.2 + float3(0.0, 0.0, time * 0.22));
+            wisp = pow(max(wisp, 0.0), 2.0) * 1.6;
+            emis += float3(0.30, 0.90, 0.80) * (shell * wisp * 0.020);
+        }
+        return emis;
+    }
+
+    static float3 ps_surfaceShade(float3 Phit, float3 dir, float time) {
+        float3 n = normalize(Phit);
+        float3 nc = rotZ(n, -PS_OMEGA * time);
+        float cm = clamp(abs(dot(nc, PS_M0)), 0.0, 1.0);
+        float am = acos(cm);
+
+        float3 e1m = normalize(cross(PS_M0, float3(0.0, 0.0, 1.0)));
+        float3 e2m = cross(PS_M0, e1m);
+        float phm = atan2(dot(nc, e2m), dot(nc, e1m));
+
+        float cap  = exp(-pow(am / 0.16, 2.0));
+        float cap2 = exp(-pow(am / 0.40, 2.0));
+        float belt = smoothstep(0.80, 1.30, am);
+        float band = fbm4(float3(am * 6.0, phm * 1.2, 4.1));
+        float low  = fbm4(nc * 3.2 + float3(7.7, 2.9, 5.1));
+
+        float T = mix(9200.0, 3300.0, belt)
+                + 1100.0 * (band - 0.5) + 600.0 * (low - 0.5)
+                + 11000.0 * cap + 2600.0 * cap2;
+
+        float mu = clamp(abs(dot(dir, n)), 0.0, 1.0);
+        float limb = 0.50 + 0.50 * mu;
+        float mottle = 0.88 + 0.35 * (low - 0.5) + 0.20 * (band - 0.5);
+        float bright = clamp(pow(T / 8800.0, 2.5), 0.14, 2.2);
+        float3 col = blackbody(T) * bright * (limb * mottle * 1.15);
+        col *= mix(float3(1.0), float3(1.30, 0.62, 0.28), belt * 0.85);
+        col += cap * float3(0.75, 0.86, 1.00) * 2.4;
+        col += pow(1.0 - mu, 4.0) * float3(0.50, 0.68, 1.00) * 0.5;
+        return col;
+    }
+
+    fragment float4 pulsar_scene(VOut in [[stage_in]], constant Uniforms& U [[buffer(0)]]) {
+        float2 px = float2(in.pos.x - 0.5 * U.res.x, 0.5 * U.res.y - in.pos.y)
+                  / U.res.y * 2.0;
+        float az = -2.30 + 0.05 * U.time;
+        float el = 0.25, dist = 17.0;
+        float3 ro = float3(dist * cos(el) * cos(az), dist * cos(el) * sin(az),
+                           dist * sin(el));
+        float3 fwd = normalize(-ro);
+        float3 right = normalize(cross(fwd, float3(0, 0, 1)));
+        float3 up = cross(right, fwd);
+        float tanHalf = tan(55.0 * PI / 360.0);
+        float3 rd = normalize(fwd + tanHalf * (px.x * right + px.y * up));
+
+        float r0 = length(ro);
+        float3 er = ro / r0;
+        float3 nv = cross(er, rd);
+        float nlen = length(nv);
+        if (nlen < 1e-4) {
+            rd = normalize(rd + 1e-3 * up);
+            nv = cross(er, rd);
+            nlen = length(nv);
+        }
+        float3 nh = nv / nlen;
+        float3 e2 = cross(nh, er);
+
+        float fcam = 1.0 - 2.0 / r0;
+        float vr = dot(rd, er);
+        float vt = nlen;
+
+        float u = 1.0 / r0;
+        float w = -u * sqrt(fcam) * vr / vt;
+
+        float3 col = float3(0.0);
+        float phi = 0.0;
+        float3 Pprev = ro;
+        bool hit = false, escaped = false;
+        float3 Phit = float3(0.0), dirHit = rd;
+
+        for (int i = 0; i < PS_MAX_STEPS; i++) {
+            float h = (u > 0.15) ? 0.03 : ((u > 0.05) ? 0.05 : 0.08);
+
+            float u0 = u, w0 = w;
+            float k1u = w0,                k1w = 3.0 * u0 * u0 - u0;
+            float ua = u0 + 0.5 * h * k1u, wa = w0 + 0.5 * h * k1w;
+            float k2u = wa,                k2w = 3.0 * ua * ua - ua;
+            float ub = u0 + 0.5 * h * k2u, wb = w0 + 0.5 * h * k2w;
+            float k3u = wb,                k3w = 3.0 * ub * ub - ub;
+            float uc = u0 + h * k3u,       wc = w0 + h * k3w;
+            float k4u = wc,                k4w = 3.0 * uc * uc - uc;
+            float un = u0 + h / 6.0 * (k1u + 2.0 * k2u + 2.0 * k3u + k4u);
+            float wn = w0 + h / 6.0 * (k1w + 2.0 * k2w + 2.0 * k3w + k4w);
+            float phin = phi + h;
+
+            if (un >= PS_U_SURF) {
+                float t = clamp((PS_U_SURF - u0) / max(un - u0, 1e-9), 0.0, 1.0);
+                float phiH = phi + h * t;
+                Phit = PS_R_NS * (cos(phiH) * er + sin(phiH) * e2);
+                float wH = mix(w0, wn, t);
+                float3 rhat = cos(phiH) * er + sin(phiH) * e2;
+                float3 that = -sin(phiH) * er + cos(phiH) * e2;
+                dirHit = normalize(-wH * rhat + PS_U_SURF * that);
+                float ds = length(Phit - Pprev);
+                col += ds * ps_volumeEmis(0.5 * (Phit + Pprev), U.time);
+                hit = true;
+                break;
+            }
+
+            float3 P = (cos(phin) * er + sin(phin) * e2) / un;
+            float ds = length(P - Pprev);
+            col += ds * ps_volumeEmis(0.5 * (P + Pprev), U.time);
+            Pprev = P;
+
+            u = un; w = wn; phi = phin;
+            if (u < PS_U_ESC && w < 0.0) { escaped = true; break; }
+            if (phi > PS_PHI_MAX) break;
+        }
+
+        if (hit) {
+            col += ps_surfaceShade(Phit, dirHit, U.time);
+        } else if (escaped) {
+            float3 rhat = cos(phi) * er + sin(phi) * e2;
+            float3 that = -sin(phi) * er + cos(phi) * e2;
+            float3 escDir = normalize(-w * rhat + u * that);
+            col += background(escDir);
+        }
+        return float4(col, 1.0);
+    }
+
+    // =========================================================== quasar ====
+    // Same geodesic engine as the black hole, plus volumetrics along the bent
+    // rays: Doppler-boosted relativistic jets (beta = 0.88, delta^3.2 — the
+    // counter-jet nearly vanishes), a clumpy absorbing dust torus with a
+    // disk-heated rim, and an X-ray corona. Disk is hotter/larger (r = 6-20M).
+    static float2 q_diskTex(float chi, float r, float Om, float tOff, float drift, float seed) {
+        float chiM = chi - Om * tOff * 8.0;
+        float tex  = fbm4(float3(cos(chiM) * 0.9, sin(chiM) * 0.9, r * 1.35) * 2.2
+                          + float3(seed, seed * 1.7, seed * 0.6));
+        float tex2 = fbm4(float3(cos(chiM) * 3.0, sin(chiM) * 3.0, r * 0.7)
+                          + float3(seed * 2.3, seed, drift));
+        return float2(tex, tex2);
+    }
+
+    static float3 q_diskShade(float r, float chi, float Lz, float sqrtFcam,
+                              float time, thread float &alpha) {
+        float Om = pow(r, -1.5);
+        float g = sqrt(max(1.0 - 3.0 / r, 0.0))
+                / (max(1.0 - Om * Lz, 1e-3) * sqrtFcam);
+
+        float xx = max(1.0 - sqrt(R_ISCO / r), 0.0);
+        float Trel = pow(xx / (r * r * r), 0.25) * 7.857;
+
+        const float FLOW_P = 40.0;
+        float f0 = fract(time / FLOW_P);
+        float wA = 1.0 - abs(2.0 * f0 - 1.0);
+        float wB = 1.0 - wA;
+        float tA = (f0 - 0.5) * FLOW_P;
+        float tB = (fract(time / FLOW_P + 0.5) - 0.5) * FLOW_P;
+        float drift = time * 0.05;
+        float2 xA = q_diskTex(chi, r, Om, tA, drift, 0.0);
+        float2 xB = q_diskTex(chi, r, Om, tB, drift, 19.7);
+        float2 x = 0.5 + ((xA - 0.5) * wA + (xB - 0.5) * wB)
+                         * rsqrt(max(wA * wA + wB * wB, 0.5));
+        float tex = x.x, tex2 = x.y;
+        float pattern = pow(0.35 + 1.30 * tex, 2.2) + 0.35 * tex2;
+
+        float edgeIn  = smoothstep(R_ISCO, R_ISCO + 0.6, r);
+        float edgeOut = 1.0 - smoothstep(14.5, 20.0, r);
+        float shape = edgeIn * edgeOut;
+
+        float Tobs = 6600.0 * Trel * g;
+        float boost = pow(max(Trel, 0.0), 4.0) * pow(g, 4.0);
+
+        alpha = clamp((0.40 + 0.60 * tex) * shape * 1.1, 0.0, 0.92);
+        return blackbody(Tobs) * (boost * pattern * shape * 3.6);
+    }
+
+    static float3 q_jetEmis(float3 P, float3 dir, float time) {
+        float az = abs(P.z);
+        if (az < 1.6 || az > 80.0) return float3(0.0);
+        float rho = length(P.xy);
+        float Rj = 0.55 + 0.17 * az;
+        if (rho > 2.6 * Rj) return float3(0.0);
+        float prof = exp(-pow(rho / Rj, 2.0) * 1.4);
+        float sz = sign(P.z);
+
+        float phih = atan2(P.y, P.x) - sz * az * 0.5 + time * 0.6 * sz;
+        float fil = 0.5 + 0.85 * fbm4(float3(cos(phih) * 1.1, sin(phih) * 1.1,
+                                             az * 0.42 - time * 2.6));
+        float kn = pow(0.45 + 0.55 * vnoise(float3(0.0, sz * 2.7, az * 0.55 - time * 3.2)), 3.0);
+
+        float cth = dot(-dir, float3(0.0, 0.0, sz));
+        const float beta = 0.88, gam = 2.1067;
+        float dop = 1.0 / (gam * (1.0 - beta * cth));
+        float boost = clamp(pow(dop, 3.2), 0.004, 40.0);
+
+        float rad = 9.0 / (10.0 + az * az * 0.06) * smoothstep(1.6, 6.5, az);
+        float3 cj = mix(float3(0.45, 0.55, 1.00), float3(0.95, 0.92, 1.00), prof);
+        return cj * (prof * (0.5 + fil) * (0.55 + kn) * rad * boost * 2.0);
+    }
+
+    static float q_torusField(float3 P, float time, thread float &heat) {
+        heat = 0.0;
+        float rc = length(P.xy);
+        float d = sqrt((rc - 33.0) * (rc - 33.0) + P.z * P.z * 1.6);
+        if (d > 9.0) return 0.0;
+        float dens = smoothstep(9.0, 4.0, d) * smoothstep(24.0, 29.0, rc);
+        if (dens < 1e-3) return 0.0;
+        float phi = atan2(P.y, P.x);
+        dens *= 0.30 + 0.85 * fbm4(float3(cos(phi) * 6.0, sin(phi) * 6.0, P.z * 0.4)
+                                   + float3(0.0, 0.0, time * 0.05));
+        heat = exp(-max(rc - 27.0, 0.0) / 7.0);
+        return dens;
+    }
+
+    fragment float4 quasar_scene(VOut in [[stage_in]], constant Uniforms& U [[buffer(0)]]) {
+        float2 px = float2(in.pos.x - 0.5 * U.res.x, 0.5 * U.res.y - in.pos.y)
+                  / U.res.y * 2.0;
+        float az = -2.30 + 0.05 * U.time;
+        float el = 0.35, dist = 34.0;
+        float3 ro = float3(dist * cos(el) * cos(az), dist * cos(el) * sin(az),
+                           dist * sin(el));
+        float3 fwd = normalize(-ro);
+        float3 right = normalize(cross(fwd, float3(0, 0, 1)));
+        float3 up = cross(right, fwd);
+        float tanHalf = tan(55.0 * PI / 360.0);
+        float3 rd = normalize(fwd + tanHalf * (px.x * right + px.y * up));
+
+        float r0 = length(ro);
+        float3 er = ro / r0;
+        float3 nv = cross(er, rd);
+        float nlen = length(nv);
+        if (nlen < 1e-4) {
+            rd = normalize(rd + 1e-3 * up);
+            nv = cross(er, rd);
+            nlen = length(nv);
+        }
+        float3 nh = nv / nlen;
+        float3 e2 = cross(nh, er);
+
+        float fcam = 1.0 - 2.0 / r0;
+        float sqrtFcam = sqrt(fcam);
+        float vr = dot(rd, er);
+        float vt = nlen;
+
+        float u = 1.0 / r0;
+        float w = -u * sqrtFcam * vr / vt;
+        float b = r0 * vt / sqrtFcam;
+        float Lz = b * nh.z;
+
+        float A = er.z, B = e2.z;
+        float Rz = sqrt(A * A + B * B);
+        float phiC = 1e9;
+        if (Rz > 1e-4) {
+            float phi0 = atan2(-A, B);
+            float k = ceil((1e-4 - phi0) / PI);
+            phiC = phi0 + k * PI;
+        }
+
+        float3 col = float3(0.0);
+        float trans = 1.0;
+        float phi = 0.0;
+        float3 Pprev = ro;
+        bool escaped = false;
+
+        for (int i = 0; i < MAX_STEPS; i++) {
+            float h = (u > 0.15) ? 0.035 : ((u > 0.04) ? 0.06 : 0.09);
+
+            float u0 = u, w0 = w;
+            float k1u = w0,                k1w = 3.0 * u0 * u0 - u0;
+            float ua = u0 + 0.5 * h * k1u, wa = w0 + 0.5 * h * k1w;
+            float k2u = wa,                k2w = 3.0 * ua * ua - ua;
+            float ub = u0 + 0.5 * h * k2u, wb = w0 + 0.5 * h * k2w;
+            float k3u = wb,                k3w = 3.0 * ub * ub - ub;
+            float uc3 = u0 + h * k3u,      wc3 = w0 + h * k3w;
+            float k4u = wc3,               k4w = 3.0 * uc3 * uc3 - uc3;
+            float un = u0 + h / 6.0 * (k1u + 2.0 * k2u + 2.0 * k3u + k4u);
+            float wn = w0 + h / 6.0 * (k1w + 2.0 * k2w + 2.0 * k3w + k4w);
+            float phin = phi + h;
+
+            while (phiC <= phin && trans > 0.02) {
+                float t = (phiC - phi) / h;
+                float h00 = (2.0 * t - 3.0) * t * t + 1.0;
+                float h10 = ((t - 2.0) * t + 1.0) * t;
+                float h01 = (3.0 - 2.0 * t) * t * t;
+                float h11 = (t - 1.0) * t * t;
+                float ucr = h00 * u0 + h10 * h * w0 + h01 * un + h11 * h * wn;
+                float rc = 1.0 / max(ucr, 1e-6);
+                if (rc >= R_ISCO && rc <= 20.0) {
+                    float3 P = rc * (cos(phiC) * er + sin(phiC) * e2);
+                    float chi = atan2(P.y, P.x);
+                    float a;
+                    float3 dc = q_diskShade(rc, chi, Lz, sqrtFcam, U.time, a);
+                    col += trans * dc;
+                    trans *= (1.0 - a);
+                }
+                phiC += PI;
+            }
+
+            float3 P = (cos(phin) * er + sin(phin) * e2) / un;
+            float ds = length(P - Pprev);
+            float3 Pm = 0.5 * (P + Pprev);
+            float3 tangent = (P - Pprev) / max(ds, 1e-6);
+            col += trans * ds * q_jetEmis(Pm, tangent, U.time);
+            float heat;
+            float dens = q_torusField(Pm, U.time, heat);
+            if (dens > 0.0) {
+                col += trans * ds * dens * heat * float3(1.0, 0.42, 0.14) * 0.02;
+                trans *= exp(-dens * 0.10 * ds);
+            }
+            float rm = length(Pm);
+            if (rm < 8.0)
+                col += trans * ds * exp(-(rm - 2.0) / 1.5) * float3(0.65, 0.78, 1.00) * 0.012;
+            Pprev = P;
+
+            u = un; w = wn; phi = phin;
+            if (trans <= 0.02) break;
+            if (u > U_CAP) break;
+            if (u < U_ESC && w < 0.0) { escaped = true; break; }
+            if (phi > PHI_MAX) break;
+        }
+
+        if (escaped && trans > 0.02) {
             float3 rhat = cos(phi) * er + sin(phi) * e2;
             float3 that = -sin(phi) * er + cos(phi) * e2;
             float3 escDir = normalize(-w * rhat + u * that);

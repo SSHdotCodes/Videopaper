@@ -13,10 +13,10 @@ expose a public API for setting a video as the system wallpaper asset, so
 Videopaper uses desktop-level, click-through AppKit windows: motion renders
 over the static wallpaper while staying behind normal app windows.
 
-## The black hole
+## The relativistic scenes
 
-The headline scene (`Sources/Videopaper/Services/BlackHoleRenderer.swift`) is a
-real Schwarzschild geodesic ray tracer in Metal, not a video loop:
+Three scenes (`Sources/Videopaper/Services/BlackHoleRenderer.swift`) are real
+Schwarzschild geodesic ray tracers in Metal, not video loops. The black hole:
 
 - every pixel integrates the exact null-geodesic (Binet) equation
   `d²u/dφ² = 3u² − u` through curved spacetime with RK4 — gravitational
@@ -31,10 +31,22 @@ real Schwarzschild geodesic ray tracer in Metal, not a video loop:
   tonemap, driven by a `CVDisplayLink` capped at 60 fps
 - fully halts (zero CPU/GPU) when the wallpaper is occluded or the screen locks
 
+The **pulsar** is an oblique-rotator neutron star with R = 4.2 GM/c^2
+(compactness 0.48): the same geodesic integrator with a solid surface, so
+gravitational self-lensing brings the far side into view — both magnetic polar
+caps at once. A tilted corotating dipole drives hollow beam cones (the
+lighthouse flash emerges from the volume integral along bent rays), aurora-like
+L-shell glow, and a magnetic-thermal surface map (hot caps, cool ember belt on
+the magnetic equator). The **quasar** adds volumetrics along the bent rays:
+relativistic jets with per-sample Doppler boosting (beta = 0.88 — the
+counter-jet nearly vanishes, like real one-sided quasar jets), a clumpy
+absorbing dust torus with a disk-heated rim, an X-ray corona, and a hotter
+near-Eddington disk.
+
 ## Features
 
-- Built-in animated scenes: Black Hole, Aurora, Stars, Sunrise, Daylight,
-  Sunset, Moonlight, Prism, and Ember.
+- Built-in animated scenes: Black Hole, Pulsar, Quasar, Aurora, Stars,
+  Sunrise, Daylight, Sunset, Moonlight, Prism, and Ember.
 - Local video wallpaper playback with looping, speed, fit mode, audio
   mute/volume, and dimming controls.
 - Multi-monitor detection with per-display enable toggles and per-monitor

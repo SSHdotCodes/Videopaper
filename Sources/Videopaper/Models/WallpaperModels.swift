@@ -26,6 +26,8 @@ enum AmbientStyle: String, Codable, CaseIterable, Identifiable {
     case prism
     case ember
     case blackHole
+    case pulsar
+    case quasar
 
     var id: String { rawValue }
 
@@ -40,6 +42,8 @@ enum AmbientStyle: String, Codable, CaseIterable, Identifiable {
         case .prism: "Prism"
         case .ember: "Ember"
         case .blackHole: "Black Hole"
+        case .pulsar: "Pulsar"
+        case .quasar: "Quasar"
         }
     }
 
@@ -54,6 +58,8 @@ enum AmbientStyle: String, Codable, CaseIterable, Identifiable {
         case .prism: "Color-shifting spectrum"
         case .ember: "Low molten warmth"
         case .blackHole: "Ray-traced gravitational lensing"
+        case .pulsar: "Lensed neutron star, sweeping beams"
+        case .quasar: "Relativistic jets and dusty torus"
         }
     }
 
@@ -68,11 +74,13 @@ enum AmbientStyle: String, Codable, CaseIterable, Identifiable {
         case .prism: "camera.filters"
         case .ember: "flame.fill"
         case .blackHole: "circle.circle.fill"
+        case .pulsar: "light.beacon.max.fill"
+        case .quasar: "rays"
         }
     }
 
     /// Styles rendered live with Metal rather than Core Animation layers.
-    var usesMetal: Bool { self == .blackHole }
+    var usesMetal: Bool { self == .blackHole || self == .pulsar || self == .quasar }
 }
 
 enum VideoFitMode: String, Codable, CaseIterable, Identifiable {

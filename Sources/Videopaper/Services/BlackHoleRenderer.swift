@@ -199,7 +199,16 @@ final class BlackHoleRenderer {
         allocatedSize = pixelSize
     }
 
+    /// Called from the CVDisplayLink thread, which has no runloop and thus
+    /// never drains an autorelease pool. Without the explicit pool below,
+    /// every frame's command buffer, encoders, and drawable wrapper (~90
+    /// small ObjC objects at 60 fps) accumulate forever — a multi-GB-per-day
+    /// "leak" that vmmap shows as tens of millions of live tiny mallocs.
     private func render() {
+        autoreleasepool { renderFrame() }
+    }
+
+    private func renderFrame() {
         lock.lock()
         defer { lock.unlock() }
         guard running, !paused, pixelSize.width > 1 else { return }
